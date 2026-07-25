@@ -39,6 +39,9 @@ This project provide, but not limited to:
 * ***python library*** - all of this is also maintained from a python library, that provide clear and easy
   usage of the features that the application provides, with plenty of examples, to help you start
   programming and implementing your project in no time.
+* ***AI voice missions (Gemini Robotics VLA)*** - speak an instruction to the app, and a Gemini
+  Robotics model flies the drone in a closed loop using the live camera image. See the
+  "AI voice missions" section below.
 
 
 ## How to compile - drone side (server side)
@@ -121,6 +124,57 @@ And that all about the application! you should not mind the code of the applicat
 The intention is that you use it as black box. However, feel free to look inside,
 and if you wish to extend and add your own features, just *fork* this repo.
 I tried to comment the code and and write it as logical as I could, all for you.
+
+
+## AI voice missions (Gemini Robotics VLA)
+The app can fly the drone from a spoken instruction using a Gemini Robotics model
+as a vision-language-action (VLA) policy. The loop runs entirely on the phone:
+
+1. You speak (or type) an instruction, e.g. *"take off, look around for the red chair and fly towards it"*.
+2. The app grabs the current frame from the drone camera and sends it, together with the
+   instruction, telemetry and the action history, to the Gemini API.
+3. The model answers with one small action (`takeoff`, `move` with body-frame velocities,
+   `land` or `done`), the app executes it through the virtual sticks, and the loop repeats
+   with a fresh camera frame until the model reports `done`, it lands, or you stop it.
+
+### Setup
+1. Create a Gemini API key at https://aistudio.google.com/apikey
+2. Put the key into `app/src/main/res/values/secrets.xml` (the same file that holds the DJI key):
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="API_KEY">xxxxxxxxxxxxxxxxxxxxxxxx</string>
+    <string name="GEMINI_API_KEY">your-gemini-api-key</string>
+</resources>
+```
+3. The model defaults to `gemini-robotics-er-1.6-preview` (Gemini Robotics-ER,
+   the embodied-reasoning model that is publicly available through the Gemini API).
+   You can switch to another vision model (e.g. `gemini-3.5-flash`) by editing
+   `gemini_model_name` in `app/src/main/res/values/strings.xml`. If a mission
+   aborts with an HTTP 404 "model not available" error, the preview model was
+   likely retired - list your available models with the API and pick a newer one.
+4. The phone needs an internet connection while connected to the remote controller
+   (WiFi or cellular) for the Gemini API calls.
+
+### Usage
+* Tap `AI VOICE MISSION` on the main screen.
+* Tap `🎤 Speak` and say the instruction (or type it), then `START MISSION` and confirm.
+* `STOP (HOVER)` aborts the mission - the drone stops moving, hovers, and stick control
+  returns to the remote controller.
+* `EMERGENCY STOP - LAND` aborts the mission, returns stick control to the remote
+  controller and starts an automatic landing (landing confirmation is answered
+  automatically). The `EMERGENCY STOP` button on the main screen keeps working as before.
+
+### Safety notes
+> **This is an experimental feature - a language model is flying your drone.**
+> * Fly only in open areas, away from people, and keep the drone in sight at all times.
+> * Keep a hand near `EMERGENCY STOP`, and remember the physical remote controller
+>   sticks: pausing/stopping returns control to the remote controller.
+> * The app clamps every model command: horizontal speed ≤ 1 m/s, vertical ≤ 0.5 m/s,
+>   yaw ≤ 45 °/s, ≤ 4 s per movement, at most 60 steps per mission
+>   (see `VlaAction.java` if you want different limits).
+> * Movements are timed velocity commands - there is no obstacle avoidance beyond
+>   what the drone itself provides. Expect drift; the model corrects visually each step.
 
 
 ## How to compile - user side (from the PC)

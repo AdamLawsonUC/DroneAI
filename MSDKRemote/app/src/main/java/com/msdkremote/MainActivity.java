@@ -418,6 +418,11 @@ public class MainActivity extends AppCompatActivity
     }
 
 
+    public void StartVlaActivity(View view) {
+        startActivity(new Intent(this, com.msdkremote.vla.VlaActivity.class));
+    }
+
+
     @Override
     public void onBackPressed() {
         // Do noting when back pressed (e.g. don't close activity)

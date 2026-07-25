@@ -29,4 +29,26 @@
     <string name="drone_icon">Drone Icon</string>
 
     <string name="control_demo">CONTROL DEMO</string>
+
+    <!-- Gemini VLA voice missions -->
+    <string name="vla_mission_button">AI VOICE MISSION</string>
+    <string name="gemini_model_name" translatable="false">gemini-robotics-er-1.6-preview</string>
+
+    <string name="vla_instruction_hint">Mission instruction…</string>
+    <string name="vla_speak">🎤 Speak</string>
+    <string name="vla_speak_prompt">Speak the drone instruction</string>
+    <string name="vla_no_speech_service">No speech recognition service on this phone</string>
+
+    <string name="vla_start">START MISSION</string>
+    <string name="vla_stop">STOP (HOVER)</string>
+    <string name="vla_emergency_stop">EMERGENCY STOP – LAND</string>
+
+    <string name="vla_no_instruction">Enter or speak an instruction first</string>
+    <string name="vla_no_api_key">No Gemini API key – add GEMINI_API_KEY to secrets.xml</string>
+    <string name="vla_drone_not_connected">Drone is not connected</string>
+    <string name="vla_landing_started">Landing…</string>
+
+    <string name="vla_confirm_title">Start AI mission?</string>
+    <string name="vla_confirm_message">Gemini will take control of the drone and execute:\n\n"%1$s"\n\nMake sure the area is clear and keep a hand near EMERGENCY STOP.</string>
+    <string name="vla_confirm_start">Start</string>
 </resources>

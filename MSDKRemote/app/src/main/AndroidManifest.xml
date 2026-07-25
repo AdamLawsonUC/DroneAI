@@ -17,6 +17,13 @@
         android:name="android.hardware.usb.accessory"
         android:required="true" />
 
+    <!-- Needed on Android 11+ to reach the system speech recognizer -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+    </queries>
+
     <application
         android:name=".MyApplication"
         android:allowBackup="true"
@@ -31,6 +38,11 @@
 
         <activity
             android:name=".ControlActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <activity
+            android:name=".vla.VlaActivity"
             android:exported="false"
             android:screenOrientation="portrait" />
 
