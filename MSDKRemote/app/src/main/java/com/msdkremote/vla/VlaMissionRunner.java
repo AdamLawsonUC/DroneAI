@@ -14,13 +14,21 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import dji.sdk.keyvalue.key.DJIActionKeyInfo;
 import dji.sdk.keyvalue.key.FlightControllerKey;
+import dji.sdk.keyvalue.key.GimbalKey;
 import dji.sdk.keyvalue.key.KeyTools;
+import dji.sdk.keyvalue.value.common.Attitude;
 import dji.sdk.keyvalue.value.common.EmptyMsg;
+import dji.sdk.keyvalue.value.common.LocationCoordinate2D;
+import dji.sdk.keyvalue.value.common.LocationCoordinate3D;
 import dji.sdk.keyvalue.value.flightcontroller.FlightCoordinateSystem;
+import dji.sdk.keyvalue.value.flightcontroller.GPSSignalLevel;
 import dji.sdk.keyvalue.value.flightcontroller.RollPitchControlMode;
 import dji.sdk.keyvalue.value.flightcontroller.VerticalControlMode;
 import dji.sdk.keyvalue.value.flightcontroller.VirtualStickFlightControlParam;
 import dji.sdk.keyvalue.value.flightcontroller.YawControlMode;
+import dji.sdk.keyvalue.value.gimbal.GimbalAngleRotation;
+import dji.sdk.keyvalue.value.gimbal.GimbalAngleRotationMode;
+import dji.sdk.keyvalue.value.gimbal.GimbalMode;
 import dji.v5.common.callback.CommonCallbacks;
 import dji.v5.common.error.IDJIError;
 import dji.v5.manager.KeyManager;
@@ -44,8 +52,8 @@ public class VlaMissionRunner
 {
     private static final String TAG = VlaMissionRunner.class.getSimpleName();
 
-    private static final int MAX_STEPS = 60;
-    private static final int HISTORY_IN_PROMPT = 10;
+    private static final int MAX_STEPS = 150;
+    private static final int HISTORY_IN_PROMPT = 25;
 
     private static final int FRAME_MAX_WIDTH = 640;
     private static final int FRAME_JPEG_QUALITY = 70;
@@ -55,6 +63,21 @@ public class VlaMissionRunner
     private static final long TAKEOFF_TIMEOUT_MS = 20_000;
     private static final long LANDING_TIMEOUT_MS = 60_000;
     private static final long ACTION_TIMEOUT_S = 10;
+
+    // Gimbal rotation pacing: rotation time plus settling before the
+    // next frame is captured.
+    private static final double GIMBAL_ROTATE_DURATION_S = 1.0;
+    private static final long GIMBAL_SETTLE_MS = 500;
+    private static final double GIMBAL_PITCH_TOLERANCE_DEG = 3.0;
+    private static final long GIMBAL_VERIFY_TIMEOUT_MS = 3000;
+
+    // goto_gps navigation controller.
+    private static final double GOTO_ARRIVE_RADIUS_M = 2.0;    // stop within this
+    private static final double GOTO_SLOWDOWN_RADIUS_M = 12.0; // start braking here
+    private static final double GOTO_ALIGN_TOLERANCE_DEG = 25.0; // fly fwd when facing target
+    private static final double GOTO_YAW_GAIN = 0.8;           // deg/s per deg of error
+    private static final long GOTO_TIMEOUT_MS = 240_000;
+    private static final int GOTO_MIN_SATELLITES = 8;
 
     /** Mission callbacks; invoked on the mission thread. */
     public interface Listener {
@@ -83,6 +106,14 @@ public class VlaMissionRunner
     private volatile boolean isFlying = false;
     private volatile double altitude = 0.0;
     private volatile double heading = 0.0;
+
+    // GPS and gimbal state. Location objects are immutable value
+    // holders from the SDK; null means "no fix / unknown yet".
+    @Nullable private volatile LocationCoordinate3D location = null;
+    @Nullable private volatile LocationCoordinate2D homeLocation = null;
+    private volatile int satelliteCount = 0;
+    private volatile GPSSignalLevel gpsSignalLevel = GPSSignalLevel.UNKNOWN;
+    private volatile double gimbalPitch = 0.0;
 
     private boolean virtualStickEnabled = false;
 
@@ -153,6 +184,7 @@ public class VlaMissionRunner
         seedTelemetry();
 
         List<String> history = new ArrayList<>();
+        String plan = null;
         String endError = null;
         String endSummary = "Mission ended.";
 
@@ -174,7 +206,7 @@ public class VlaMissionRunner
                 VlaDecision decision;
                 try {
                     decision = client.decide(
-                            instruction, jpeg, telemetryLine(), tail(history));
+                            instruction, jpeg, telemetryLine(), plan, tail(history));
                 }
                 catch (Exception e) {
                     throw new MissionAbort("Gemini request failed: " + e.getMessage());
@@ -183,22 +215,29 @@ public class VlaMissionRunner
                 if (!running)
                     break;
 
+                if (decision.plan != null)
+                    plan = decision.plan;
+
                 listener.onDecision(step, decision);
-                history.add("step " + step + ": " + decision.action
-                        + " (" + decision.reasoning + ")");
+                history.add("step " + step + " @ [" + positionStamp() + "]: "
+                        + decision.actionsLine() + " (" + decision.reasoning + ")");
 
-                VlaAction action = decision.action;
+                // Execute the whole sequence before consulting the model again.
+                for (VlaAction action : decision.actions) {
+                    if (!running)
+                        break;
 
-                if (action.type == VlaAction.Type.DONE) {
-                    endSummary = "Model reports mission done: " + decision.reasoning;
-                    return;
-                }
+                    if (action.type == VlaAction.Type.DONE) {
+                        endSummary = "Model reports mission done: " + decision.reasoning;
+                        return;
+                    }
 
-                executeAction(action);
+                    executeAction(action);
 
-                if (action.type == VlaAction.Type.LAND) {
-                    endSummary = "Mission ended with landing.";
-                    return;
+                    if (action.type == VlaAction.Type.LAND) {
+                        endSummary = "Mission ended with landing.";
+                        return;
+                    }
                 }
             }
 
@@ -232,9 +271,103 @@ public class VlaMissionRunner
 
     private String telemetryLine()
     {
+        StringBuilder line = new StringBuilder(String.format(Locale.ENGLISH,
+                "flying=%b, relative altitude=%.1f m, compass heading=%.0f deg, "
+                        + "gimbal pitch=%.0f deg",
+                isFlying, altitude, heading, gimbalPitch));
+
+        LocationCoordinate3D loc = location;
+        if (hasGpsFix(loc)) {
+            line.append(String.format(Locale.ENGLISH,
+                    ", gps=(%.6f, %.6f), satellites=%d (signal %s)",
+                    loc.getLatitude(), loc.getLongitude(),
+                    satelliteCount, gpsSignalLevel));
+        }
+        else {
+            line.append(", gps=no fix");
+        }
+
+        LocationCoordinate2D home = homeLocation;
+        if (hasGpsFix(loc) && isValidLatLon(home)) {
+            double distance = distanceMeters(
+                    loc.getLatitude(), loc.getLongitude(),
+                    home.getLatitude(), home.getLongitude());
+            line.append(String.format(Locale.ENGLISH,
+                    ", home point=(%.6f, %.6f) %.0f m away at bearing %.0f deg",
+                    home.getLatitude(), home.getLongitude(), distance,
+                    bearingDegrees(loc.getLatitude(), loc.getLongitude(),
+                            home.getLatitude(), home.getLongitude())));
+        }
+
+        return line.toString();
+    }
+
+    /** Compact position used to stamp history entries. */
+    private String positionStamp()
+    {
+        LocationCoordinate3D loc = location;
+        if (!hasGpsFix(loc))
+            return String.format(Locale.ENGLISH,
+                    "no gps, alt %.1f m, hdg %.0f", altitude, heading);
+
         return String.format(Locale.ENGLISH,
-                "flying=%b, relative altitude=%.1f m, compass heading=%.0f deg",
-                isFlying, altitude, heading);
+                "%.6f, %.6f, alt %.1f m, hdg %.0f",
+                loc.getLatitude(), loc.getLongitude(), altitude, heading);
+    }
+
+    // ==================== Geo helpers ====================
+
+    private static boolean hasGpsFix(@Nullable LocationCoordinate3D loc)
+    {
+        return loc != null && isValid(loc.getLatitude()) && isValid(loc.getLongitude())
+                && !(loc.getLatitude() == 0.0 && loc.getLongitude() == 0.0);
+    }
+
+    private static boolean isValidLatLon(@Nullable LocationCoordinate2D loc)
+    {
+        return loc != null && isValid(loc.getLatitude()) && isValid(loc.getLongitude())
+                && !(loc.getLatitude() == 0.0 && loc.getLongitude() == 0.0);
+    }
+
+    private static boolean isValid(@Nullable Double value)
+    {
+        return value != null && Double.isFinite(value);
+    }
+
+    /** Great-circle distance between two coordinates (haversine). */
+    private static double distanceMeters(double lat1, double lon1,
+                                         double lat2, double lon2)
+    {
+        final double earthRadius = 6_371_000.0;
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLon = Math.toRadians(lon2 - lon1);
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
+                * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    /** Initial bearing from point 1 to point 2, degrees [0, 360), 0 = north. */
+    private static double bearingDegrees(double lat1, double lon1,
+                                         double lat2, double lon2)
+    {
+        double phi1 = Math.toRadians(lat1);
+        double phi2 = Math.toRadians(lat2);
+        double dLon = Math.toRadians(lon2 - lon1);
+        double y = Math.sin(dLon) * Math.cos(phi2);
+        double x = Math.cos(phi1) * Math.sin(phi2)
+                - Math.sin(phi1) * Math.cos(phi2) * Math.cos(dLon);
+        double bearing = Math.toDegrees(Math.atan2(y, x));
+        return (bearing + 360.0) % 360.0;
+    }
+
+    /** Normalize an angle difference to [-180, 180). */
+    private static double normalizeAngle(double degrees)
+    {
+        double a = degrees % 360.0;
+        if (a >= 180.0) a -= 360.0;
+        if (a < -180.0) a += 360.0;
+        return a;
     }
 
     private List<String> tail(List<String> history)
@@ -259,6 +392,14 @@ public class VlaMissionRunner
 
             case MOVE:
                 executeMove(action);
+                break;
+
+            case GIMBAL:
+                executeGimbal(action);
+                break;
+
+            case GOTO_GPS:
+                executeGotoGps(action);
                 break;
 
             case DONE:
@@ -334,6 +475,200 @@ public class VlaMissionRunner
             sendVelocity(action.forward, action.right, action.up, action.yawRate);
             Thread.sleep(STICK_PERIOD_MS);
         }
+
+        // Back to hover.
+        for (int i = 0; i < 3; i++) {
+            sendVelocity(0, 0, 0, 0);
+            Thread.sleep(STICK_PERIOD_MS);
+        }
+    }
+
+    /**
+     * Rotate the gimbal to an absolute pitch angle and wait until the
+     * gimbal attitude telemetry confirms it arrived, so the next
+     * captured frame already shows the new view.
+     *
+     * Mini-series quirks are worked around here: the gimbal must not be
+     * in FPV mode (pitch commands are silently ignored there), and on
+     * some firmwares an ABSOLUTE_ANGLE rotation is a silent no-op, in
+     * which case a RELATIVE_ANGLE rotation by the remaining delta is
+     * tried. A gimbal that still does not move only logs a warning -
+     * the mission continues and the model sees the real pitch in the
+     * telemetry.
+     */
+    private void executeGimbal(VlaAction action) throws InterruptedException
+    {
+        listener.onInfo(String.format(Locale.ENGLISH,
+                "Rotating gimbal to %.0f deg pitch...", action.gimbalPitch));
+
+        // FPV mode ignores pitch commands; make sure we are in a
+        // pitch-controllable mode first (best effort).
+        setGimbalModeQuietly(GimbalMode.YAW_FOLLOW);
+
+        // Attempt 1: absolute angle.
+        GimbalAngleRotation rotation = new GimbalAngleRotation();
+        rotation.setMode(GimbalAngleRotationMode.ABSOLUTE_ANGLE);
+        rotation.setPitch(action.gimbalPitch);
+        rotation.setRollIgnored(true);
+        rotation.setYawIgnored(true);
+        rotation.setDuration(GIMBAL_ROTATE_DURATION_S);
+
+        String error = performActionBlocking(GimbalKey.KeyRotateByAngle, rotation);
+        if (error != null)
+            listener.onInfo("Gimbal absolute rotation rejected: " + error);
+
+        if (waitForGimbalPitch(action.gimbalPitch)) {
+            Thread.sleep(GIMBAL_SETTLE_MS);
+            return;
+        }
+
+        // Attempt 2: relative rotation by the remaining delta (works on
+        // aircraft where absolute mode is a no-op).
+        double delta = action.gimbalPitch - gimbalPitch;
+        listener.onInfo(String.format(Locale.ENGLISH,
+                "Gimbal did not move (pitch %.0f deg) - retrying with a %+.0f deg "
+                        + "relative rotation.", gimbalPitch, delta));
+
+        rotation = new GimbalAngleRotation();
+        rotation.setMode(GimbalAngleRotationMode.RELATIVE_ANGLE);
+        rotation.setPitch(delta);
+        rotation.setRollIgnored(true);
+        rotation.setYawIgnored(true);
+        rotation.setDuration(GIMBAL_ROTATE_DURATION_S);
+
+        error = performActionBlocking(GimbalKey.KeyRotateByAngle, rotation);
+        if (error != null)
+            listener.onInfo("Gimbal relative rotation rejected: " + error);
+
+        if (waitForGimbalPitch(action.gimbalPitch))
+            Thread.sleep(GIMBAL_SETTLE_MS);
+        else
+            listener.onInfo(String.format(Locale.ENGLISH,
+                    "WARNING: gimbal stuck at %.0f deg (wanted %.0f deg) - continuing.",
+                    gimbalPitch, action.gimbalPitch));
+    }
+
+    /**
+     * Wait until the gimbal attitude telemetry reports the target pitch
+     * (within tolerance). @return true if the gimbal got there.
+     */
+    private boolean waitForGimbalPitch(double targetPitch) throws InterruptedException
+    {
+        long deadline = System.currentTimeMillis() + GIMBAL_VERIFY_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline && running) {
+            if (Math.abs(gimbalPitch - targetPitch) <= GIMBAL_PITCH_TOLERANCE_DEG)
+                return true;
+            Thread.sleep(100);
+        }
+        return Math.abs(gimbalPitch - targetPitch) <= GIMBAL_PITCH_TOLERANCE_DEG;
+    }
+
+    /** Set the gimbal mode, logging (not failing) on error. */
+    private void setGimbalModeQuietly(GimbalMode mode) throws InterruptedException
+    {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final AtomicReference<String> error = new AtomicReference<>(null);
+
+        KeyManager.getInstance().setValue(
+                KeyTools.createKey(GimbalKey.KeyGimbalMode),
+                mode,
+                new CommonCallbacks.CompletionCallback() {
+                    @Override
+                    public void onSuccess() {
+                        latch.countDown();
+                    }
+
+                    @Override
+                    public void onFailure(@NonNull IDJIError idjiError) {
+                        error.set(String.valueOf(idjiError));
+                        latch.countDown();
+                    }
+                });
+
+        if (!latch.await(ACTION_TIMEOUT_S, TimeUnit.SECONDS))
+            Log.w(TAG, "Setting gimbal mode timed out");
+        else if (error.get() != null)
+            Log.w(TAG, "Setting gimbal mode failed: " + error.get());
+    }
+
+    /**
+     * Fly one navigation leg towards a GPS target: yaw until the nose
+     * (and camera) faces the target, then fly forward, braking near the
+     * goal. Altitude is held. Runs on the same body-frame virtual stick
+     * commands as MOVE, so no new coordinate conventions are involved.
+     */
+    private void executeGotoGps(VlaAction action) throws InterruptedException, MissionAbort
+    {
+        if (!isFlying) {
+            listener.onInfo("Ignored GOTO_GPS: drone is not flying (needs takeoff first).");
+            return;
+        }
+
+        LocationCoordinate3D start = location;
+        if (!hasGpsFix(start) || satelliteCount < GOTO_MIN_SATELLITES) {
+            listener.onInfo(String.format(Locale.ENGLISH,
+                    "Ignored GOTO_GPS: needs a good GPS fix (satellites=%d, need >=%d).",
+                    satelliteCount, GOTO_MIN_SATELLITES));
+            return;
+        }
+
+        double startDistance = distanceMeters(
+                start.getLatitude(), start.getLongitude(),
+                action.latitude, action.longitude);
+
+        if (startDistance > VlaAction.MAX_GOTO_DISTANCE_M) {
+            listener.onInfo(String.format(Locale.ENGLISH,
+                    "Ignored GOTO_GPS: target is %.0f m away (limit %.0f m per leg).",
+                    startDistance, VlaAction.MAX_GOTO_DISTANCE_M));
+            return;
+        }
+
+        listener.onInfo(String.format(Locale.ENGLISH,
+                "Flying to (%.6f, %.6f), %.0f m away...",
+                action.latitude, action.longitude, startDistance));
+
+        enableVirtualStickIfNeeded();
+
+        long deadline = System.currentTimeMillis() + GOTO_TIMEOUT_MS;
+
+        while (running && System.currentTimeMillis() < deadline) {
+            LocationCoordinate3D loc = location;
+            if (!hasGpsFix(loc))
+                throw new MissionAbort("GPS fix lost during goto_gps.");
+
+            double distance = distanceMeters(
+                    loc.getLatitude(), loc.getLongitude(),
+                    action.latitude, action.longitude);
+
+            if (distance <= GOTO_ARRIVE_RADIUS_M) {
+                listener.onInfo(String.format(Locale.ENGLISH,
+                        "Arrived: %.1f m from the target.", distance));
+                break;
+            }
+
+            double bearing = bearingDegrees(
+                    loc.getLatitude(), loc.getLongitude(),
+                    action.latitude, action.longitude);
+            double headingError = normalizeAngle(bearing - heading);
+
+            // Turn towards the target; fly forward once roughly aligned,
+            // slowing down within the braking radius.
+            double yawRate = Math.max(-VlaAction.MAX_YAW_RATE,
+                    Math.min(VlaAction.MAX_YAW_RATE, headingError * GOTO_YAW_GAIN));
+
+            double forward = 0.0;
+            if (Math.abs(headingError) < GOTO_ALIGN_TOLERANCE_DEG) {
+                forward = VlaAction.MAX_HORIZONTAL_SPEED
+                        * Math.min(1.0, distance / GOTO_SLOWDOWN_RADIUS_M);
+                forward = Math.max(0.2, forward);
+            }
+
+            sendVelocity(forward, 0, 0, yawRate);
+            Thread.sleep(STICK_PERIOD_MS);
+        }
+
+        if (running && System.currentTimeMillis() >= deadline)
+            listener.onInfo("goto_gps timed out - stopping here.");
 
         // Back to hover.
         for (int i = 0; i < 3; i++) {
@@ -424,11 +759,20 @@ public class VlaMissionRunner
     private String performActionBlocking(DJIActionKeyInfo<EmptyMsg, EmptyMsg> actionKey)
             throws InterruptedException
     {
+        return performActionBlocking(actionKey, new EmptyMsg());
+    }
+
+    /** Perform a DJI action with a parameter and wait for its callback. */
+    @Nullable
+    private <P> String performActionBlocking(DJIActionKeyInfo<P, EmptyMsg> actionKey, P param)
+            throws InterruptedException
+    {
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<String> error = new AtomicReference<>(null);
 
         KeyManager.getInstance().performAction(
                 KeyTools.createKey(actionKey),
+                param,
                 new CommonCallbacks.CompletionCallbackWithParam<EmptyMsg>() {
                     @Override
                     public void onSuccess(EmptyMsg emptyMsg) {
@@ -472,6 +816,28 @@ public class VlaMissionRunner
         Double cachedHeading = KeyManager.getInstance().getValue(
                 KeyTools.createKey(FlightControllerKey.KeyCompassHeading), 0.0);
         heading = (cachedHeading != null) ? cachedHeading : 0.0;
+
+        location = KeyManager.getInstance().getValue(
+                KeyTools.createKey(FlightControllerKey.KeyAircraftLocation3D),
+                (LocationCoordinate3D) null);
+
+        homeLocation = KeyManager.getInstance().getValue(
+                KeyTools.createKey(FlightControllerKey.KeyHomeLocation),
+                (LocationCoordinate2D) null);
+
+        Integer cachedSatellites = KeyManager.getInstance().getValue(
+                KeyTools.createKey(FlightControllerKey.KeyGPSSatelliteCount), 0);
+        satelliteCount = (cachedSatellites != null) ? cachedSatellites : 0;
+
+        GPSSignalLevel cachedGpsLevel = KeyManager.getInstance().getValue(
+                KeyTools.createKey(FlightControllerKey.KeyGPSSignalLevel),
+                GPSSignalLevel.UNKNOWN);
+        gpsSignalLevel = (cachedGpsLevel != null) ? cachedGpsLevel : GPSSignalLevel.UNKNOWN;
+
+        Attitude cachedGimbal = KeyManager.getInstance().getValue(
+                KeyTools.createKey(GimbalKey.KeyGimbalAttitude), (Attitude) null);
+        if (cachedGimbal != null && isValid(cachedGimbal.getPitch()))
+            gimbalPitch = cachedGimbal.getPitch();
     }
 
     private void registerTelemetryListeners()
@@ -503,6 +869,42 @@ public class VlaMissionRunner
                 this,
                 (oldValue, newValue) ->
                         heading = (newValue != null) ? newValue : 0.0);
+
+        KeyManager.getInstance().listen(
+                KeyTools.createKey(FlightControllerKey.KeyAircraftLocation3D),
+                this,
+                (oldValue, newValue) -> {
+                    if (newValue != null)
+                        location = newValue;
+                });
+
+        KeyManager.getInstance().listen(
+                KeyTools.createKey(FlightControllerKey.KeyHomeLocation),
+                this,
+                (oldValue, newValue) -> {
+                    if (newValue != null)
+                        homeLocation = newValue;
+                });
+
+        KeyManager.getInstance().listen(
+                KeyTools.createKey(FlightControllerKey.KeyGPSSatelliteCount),
+                this,
+                (oldValue, newValue) ->
+                        satelliteCount = (newValue != null) ? newValue : 0);
+
+        KeyManager.getInstance().listen(
+                KeyTools.createKey(FlightControllerKey.KeyGPSSignalLevel),
+                this,
+                (oldValue, newValue) ->
+                        gpsSignalLevel = (newValue != null) ? newValue : GPSSignalLevel.UNKNOWN);
+
+        KeyManager.getInstance().listen(
+                KeyTools.createKey(GimbalKey.KeyGimbalAttitude),
+                this,
+                (oldValue, newValue) -> {
+                    if (newValue != null && isValid(newValue.getPitch()))
+                        gimbalPitch = newValue.getPitch();
+                });
 
         // Confirm landing (needed below ~0.7 m on some aircraft) whenever asked.
         KeyManager.getInstance().listen(

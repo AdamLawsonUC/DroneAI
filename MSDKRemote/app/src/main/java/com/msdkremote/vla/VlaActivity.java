@@ -359,9 +359,16 @@ public class VlaActivity extends AppCompatActivity
     @Override
     public void onDecision(int step, VlaDecision decision)
     {
-        runOnUiThread(() -> appendLog(String.format(Locale.ENGLISH,
-                "Step %d\nGemini: %s\nAction: %s",
-                step, decision.reasoning, decision.action)));
+        runOnUiThread(() -> {
+            StringBuilder entry = new StringBuilder(String.format(Locale.ENGLISH,
+                    "Step %d\nGemini: %s\nActions: %s",
+                    step, decision.reasoning, decision.actionsLine()));
+
+            if (decision.plan != null)
+                entry.append("\nPlan: ").append(decision.plan);
+
+            appendLog(entry.toString());
+        });
     }
 
     @Override
